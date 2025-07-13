@@ -8,6 +8,7 @@
     label { display: inline-block; width: 200px; }
     input, select { width: 200px; margin-bottom: 10px; }
     button { margin: 5px; }
+    .hidden { display: none; }
     #output { white-space: pre-wrap; background: #f0f0f0; padding: 10px; margin-top: 20px; }
   </style>
 </head>
@@ -17,10 +18,12 @@
   <button id="disconnectBtn" class="connected" disabled>Disconnect</button>
   <button id="refreshBtn" class="connected" disabled>Refresh Params</button>
   <button id="setParamsBtn" class="connected" disabled>Set Params</button>
-  <button id="getUSBBtn" class="connected" disabled>Get USB String</button>
+  <button id="getUSBBtn" class="connected hidden" disabled>Get USB String</button>
   <button id="setUSBBtn" class="connected" disabled>Set USB String</button>
   <button id="setDefaultsBtn" class="connected" disabled>Set Defaults</button>
   <button id="resetBtn" class="connected" disabled>Soft Reset</button>
+  <button id="scanBtn" class="connected" disabled>Scan Device Addr</button>
+  <button id="clearLogBtn" class="connected" disabled>Clear Log</button>
 
   <h3>Configuration</h3>
   <label>Baud Rate:</label>
@@ -54,7 +57,7 @@
     <option value="0x82">HW Transparent Mode</option>
   </select><br>
 
-  <label>Device Address:</label><input id="devAddr" type="number" value="0x00" class="connected reset" disabled><br>
+  <label>Device Address:</label><input id="devAddr" type="number" value="0" class="connected reset"><br>
   <label>USB VID:</label><input id="usbVid" type="text" class="connected reset" disabled><br>
   <label>USB PID:</label><input id="usbPid" type="text" class="connected reset" disabled><br>
 
@@ -80,7 +83,6 @@
   <script>
     let port;
     const HEAD = [0x57, 0xAB];
-    const ADDR = 0x00;
 
     const checksum = data => data.reduce((a, b) => (a + b) & 0xFF, 0);
     const toBytesLE = (val, len = 2) => Array.from({length: len}, (_, i) => (val >> (8 * i)) & 0xFF);
@@ -92,18 +94,18 @@
 
     function setConnected(connected) {
       document.querySelectorAll('.connected').forEach(el => el.disabled = !connected);
-      document.querySelectorAll('.reset').forEach(el => el.value = '');
+      document.querySelectorAll('.reset').forEach(el => el.value = el.defaultValue || '');
     }
 
     async function sendFrame(cmd, data = []) {
-      const frame = [...HEAD, ADDR, cmd, data.length, ...data];
+      const frame = [...HEAD, port.devAddr, cmd, data.length, ...data];
       frame.push(checksum(frame));
       const writer = port.writable.getWriter();
       await writer.write(new Uint8Array(frame));
       writer.releaseLock();
     }
 
-    async function readResponse(timeout = 500) {
+    async function readResponse(timeout = 100) {
       const reader = port.readable.getReader();
       let chunks = [];
       let done = false;
@@ -129,15 +131,43 @@
         reader.releaseLock();
       }
 
-      if (chunks.length >= 6) {
-        const addr = chunks[2];
-        const cmd = chunks[3];
-        const len = chunks[4];
-        const data = chunks.slice(5, 5 + len);
-        const expectedChecksum = (chunks.slice(0, 5 + len).reduce((a, b) => (a + b) & 0xFF, 0)) & 0xFF;
-        const actualChecksum = chunks[5 + len];
-        const status = (expectedChecksum === actualChecksum);
-        return { addr, cmd, data, status };
+      if (chunks.length < 6)
+        return null;
+
+      const addr = chunks[2];
+      const cmd = chunks[3];
+      const len = chunks[4];
+      const data = chunks.slice(5, 5 + len);
+      const expectedChecksum = checksum(chunks.slice(0, 5 + len));
+      const actualChecksum = chunks[5 + len];
+      const status = (expectedChecksum === actualChecksum);
+      if (!status) {
+        log("Checksum error: expected " + toHex(expectedChecksum) + ", got " + toHex(actualChecksum));
+        return null;
+      }
+      return { addr, cmd, data };
+    }
+
+    async function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function sendFrameWithResponse(cmd, data, cmdResponse, retries = 3, responseTimeout = 100) {
+      await sendFrame(cmd, data);
+      for (let i = 0; i < retries; i++) {
+        const resp = await readResponse(responseTimeout);
+        if (!resp) {
+          log("No response received...");
+          await sleep(100);
+          return;
+        }
+        if (resp.addr !== port.devAddr) {
+          log("Address mismatch: expected " + toHex(port.devAddr) + ", got " + toHex(resp.addr));
+          return null;
+        }
+        if (resp.cmd === cmdResponse) {
+          return resp;
+        }
       }
       return null;
     }
@@ -147,13 +177,26 @@
       return parseInt(baudRate, 10);
     }
 
+    function getDevAddr() {
+      const deviceAddr = document.getElementById("devAddr").value || "0";
+      return parseInt(deviceAddr, 10);
+    }
+
     async function connectDevice() {
       document.getElementById("output").textContent = "Connecting...\n";
-      port = await navigator.serial.requestPort();
+      if (port)
+        await port.close();
+      else
+        port = await navigator.serial.requestPort();
       const baudRate = getBaudRate();
       await port.open({ baudRate });
       log("Connected to device at " + baudRate + " bps.");
       port.baudRate = baudRate;
+      port.devAddr = getDevAddr();
+      port.addEventListener("disconnect", () => {
+        log("Serial port disconnected.");
+        disconnectDevice();
+      });
       setConnected(true);
       await getParams();
     }
@@ -178,19 +221,19 @@
       await port.close();
       await port.open({ baudRate: newBaudRate });
       port.baudRate = baudRate;
+      port.devAddr = getDevAddr();
       log("Baud rate changed to " + newBaudRate + " bps.");
     }
 
     async function getParams() {
-      await sendFrame(0x08);
-      const resp = await readResponse();
-      if (!resp || resp.cmd !== (0x08 | 0x80)) {
+      const resp = await sendFrameWithResponse(0x08, [], 0x88);
+      if (!resp) {
         log("Failed to read config.");
-        return;
+        return false;
       }
       if (resp.data.length !== 50) {
         log("Unexpected data length: " + resp.data.length);
-        return;
+        return false;
       }
       document.getElementById("baudRate").value = fromBytesBE(resp.data.slice(3, 7)).toString();
       document.getElementById("workMode").value = `0x${toHex(resp.data[0], 1)}`;
@@ -199,14 +242,13 @@
       document.getElementById("usbVid").value = toHex(fromBytesLE(resp.data.slice(11, 13)), 2).toUpperCase();
       document.getElementById("usbPid").value = toHex(fromBytesLE(resp.data.slice(13, 15)), 2).toUpperCase();
       log("Config read successfully.");
+      return true;
     }
 
     async function setParams() {
-      await sendFrame(0x08);
-      const current = await readResponse();
-
-      if (!current || !current.status || current.cmd !== 0x88 || current.data.length !== 50) {
-        log("Failed to read existing parameters before setting.");
+      const current = await sendFrameWithResponse(0x08, [], 0x88);
+      if (!current || current.data.length !== 50) {
+        log("Failed to read config.");
         return;
       }
 
@@ -219,22 +261,25 @@
 
       data[0] = workMode;
       data[1] = serialMode;
-      data[2] = current.data[2]; // keep device address unchanged
+      data[2] = getDevAddr(); // keep device address unchanged
       data.splice(3, 7, ...toBytesBE(baud));
       data[9] = timeoutMs & 0xFF;
       data[10] = (timeoutMs >> 8) & 0xFF;
       data.splice(11, 13, ...toBytesLE(parseInt(document.getElementById("usbVid").value, 16), 2));
       data.splice(13, 15, ...toBytesLE(parseInt(document.getElementById("usbPid").value, 16), 2));
 
-      await sendFrame(0x09, data);
-      const resp = await readResponse();
-      log("Set Params: " + (resp && resp.data[0] === 0x00 ? "Success" : "Fail"));
+      const resp = await sendFrameWithResponse(0x09, data, 0x89);
+      if (resp && resp.data[0] === 0x00) {
+        log("Parameters set successfully.");
+        port.devAddr = getDevAddr();
+      } else {
+        log("Failed to set parameters.");
+      }
     }
 
     async function getUSBString() {
       const type = parseInt(document.getElementById("usbType").value);
-      await sendFrame(0x0A, [type]);
-      const resp = await readResponse();
+      const resp = await sendFrameWithResponse(0x0A, [type], 0x8A);
       if (!resp || resp.data.length < 2) {
         log("Failed to read USB string.");
         return;
@@ -252,24 +297,42 @@
       const str = document.getElementById("usbString").value;
       const strBytes = Array.from(new TextEncoder().encode(str));
       const data = [type, strBytes.length, ...strBytes];
-      await sendFrame(0x0B, data);
-      const resp = await readResponse();
+
+      const resp = await sendFrameWithResponse(0x0B, data, 0x8B);
       log("Set USB String: " + (resp && resp.data[0] === 0x00 ? "Success" : "Fail"));
     }
 
     async function setDefaults() {
-      await sendFrame(0x0C);
-      const resp = await readResponse();
+      const resp = await sendFrameWithResponse(0x0C, [], 0x8C);
       log("Set Defaults: " + (resp && resp.data[0] === 0x00 ? "Success" : "Fail"));
+      port.devAddr = 0;
+      changeBaudRate(9600);
       getParams();
     }
 
     async function softReset() {
-      await sendFrame(0x0F);
-      const resp = await readResponse();
+      const resp = await sendFrameWithResponse(0x0F, [], 0x8F);
       log("Soft Reset: " + (resp && resp.data[0] === 0x00 ? "Success" : "Fail"));
       const baudRate = getBaudRate();
       changeBaudRate(baudRate);
+    }
+
+    async function scanDeviceAddr() {
+      for (let devAddr = 0; devAddr < 256; devAddr++) {
+        log("Scanning device address: " + devAddr);
+        port.devAddr = devAddr;
+        if (await getParams()) {
+          log("Device found at address: " + devAddr);
+          return;
+        }
+      }
+
+      log("No device found at any address.");
+      document.getElementById("devAddr").value = "0";
+    }
+
+    function clearLog() {
+      document.getElementById("output").textContent = "";
     }
 
     function log(msg) {
@@ -284,6 +347,8 @@
     document.getElementById("setUSBBtn").addEventListener("click", setUSBString);
     document.getElementById("setDefaultsBtn").addEventListener("click", setDefaults);
     document.getElementById("resetBtn").addEventListener("click", softReset);
+    document.getElementById("scanBtn").addEventListener("click", scanDeviceAddr);
+    document.getElementById("clearLogBtn").addEventListener("click", clearLog);
     document.getElementById("usbType").addEventListener("change", getUSBString);
   </script>
 </body>
