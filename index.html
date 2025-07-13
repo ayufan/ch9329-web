@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CH9329 Configuration Tool</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    label { display: inline-block; width: 200px; }
+    input, select { width: 200px; margin-bottom: 10px; }
+    button { margin: 5px; }
+    #output { white-space: pre-wrap; background: #f0f0f0; padding: 10px; margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <h2>CH9329 Configuration Tool</h2>
+  <button id="connectBtn">Connect</button>
+  <button id="disconnectBtn" class="connected" disabled>Disconnect</button>
+  <button id="refreshBtn" class="connected" disabled>Refresh Params</button>
+  <button id="setParamsBtn" class="connected" disabled>Set Params</button>
+  <button id="getUSBBtn" class="connected" disabled>Get USB String</button>
+  <button id="setUSBBtn" class="connected" disabled>Set USB String</button>
+  <button id="setDefaultsBtn" class="connected" disabled>Set Defaults</button>
+  <button id="resetBtn" class="connected" disabled>Soft Reset</button>
+
+  <h3>Configuration</h3>
+  <label>Baud Rate:</label>
+  <select id="baudRate">
+    <option value="9600" selected>9600</option>
+    <option value="19200">19200</option>
+    <option value="38400">38400</option>
+    <option value="57600">57600</option>
+    <option value="115200">115200</option>
+  </select><br>
+
+  <label>Work Mode:</label>
+  <select id="workMode" class="connected reset" disabled>
+    <option value="0x00">USB Keyboard + Mouse</option>
+    <option value="0x01">USB Keyboard Only</option>
+    <option value="0x02">USB Mouse Only</option>
+    <option value="0x03">Custom HID</option>
+    <option value="0x80">HW USB Keyboard + Mouse</option>
+    <option value="0x81">HW USB Keyboard Only</option>
+    <option value="0x82">HW USB Mouse Only</option>
+    <option value="0x83">HW Custom HID</option>
+  </select><br>
+
+  <label>Serial Mode:</label>
+  <select id="serialMode" class="connected reset" disabled>
+    <option value="0x00">Protocol Mode</option>
+    <option value="0x01">ASCII Mode</option>
+    <option value="0x02">Transparent Mode</option>
+    <option value="0x80">HW Protocol Mode</option>
+    <option value="0x81">HW ASCII Mode</option>
+    <option value="0x82">HW Transparent Mode</option>
+  </select><br>
+
+  <label>Device Address:</label><input id="devAddr" type="number" value="0x00" class="connected reset" disabled><br>
+  <label>USB VID:</label><input id="usbVid" type="text" class="connected reset" disabled><br>
+  <label>USB PID:</label><input id="usbPid" type="text" class="connected reset" disabled><br>
+
+  <h3>USB String Descriptor</h3>
+  <label>Type:</label>
+  <select id="usbType" class="connected reset" disabled>
+    <option value="0">Vendor</option>
+    <option value="1">Product</option>
+    <option value="2">Serial</option>
+  </select><br>
+  <label>String:</label><input id="usbString" type="text" class="connected reset" disabled><br>
+
+  <div id="output"></div>
+
+  <script>
+    let port;
+    const HEAD = [0x57, 0xAB];
+    const ADDR = 0x00;
+
+    const checksum = data => data.reduce((a, b) => (a + b) & 0xFF, 0);
+    const toBytesLE = (val, len = 2) => Array.from({length: len}, (_, i) => (val >> (8 * i)) & 0xFF);
+    const toBytesBE = (val, len = 4) => Array.from({length: len}, (_, i) => (val >> (8 * (len - 1 - i))) & 0xFF);
+    const fromBytesLE = (bytes) => bytes.reduce((val, byte, i) => val + (byte << (8 * i)), 0);
+    const fromBytesBE = (bytes) => bytes.reduce((val, byte) => (val << 8) | byte, 0);
+    const toHex = (val, byteLength = 2) => val.toString(16).padStart(byteLength * 2, '0');
+    const fromHex = (hex) => parseInt(hex, 16);
+
+    function setConnected(connected) {
+      document.querySelectorAll('.connected').forEach(el => el.disabled = !connected);
+      document.querySelectorAll('.reset').forEach(el => el.value = '');
+    }
+
+    async function sendFrame(cmd, data = []) {
+      const frame = [...HEAD, ADDR, cmd, data.length, ...data];
+      frame.push(checksum(frame));
+      const writer = port.writable.getWriter();
+      await writer.write(new Uint8Array(frame));
+      writer.releaseLock();
+    }
+
+    async function readResponse(timeout = 500) {
+      const reader = port.readable.getReader();
+      let chunks = [];
+      let done = false;
+      const timeoutId = setTimeout(() => {
+        done = true;
+        reader.cancel();
+      }, timeout);
+
+      try {
+        while (!done) {
+          const { value, done: streamDone } = await reader.read();
+          if (streamDone) break;
+          if (value) chunks.push(...value);
+          if (chunks.length >= 5) {
+            const len = chunks[4];
+            if (chunks.length >= len + 6) break;
+          }
+        }
+      } catch (e) {
+        log("Read error: " + e);
+      } finally {
+        clearTimeout(timeoutId);
+        reader.releaseLock();
+      }
+
+      if (chunks.length >= 6) {
+        const addr = chunks[2];
+        const cmd = chunks[3];
+        const len = chunks[4];
+        const data = chunks.slice(5, 5 + len);
+        const expectedChecksum = (chunks.slice(0, 5 + len).reduce((a, b) => (a + b) & 0xFF, 0)) & 0xFF;
+        const actualChecksum = chunks[5 + len];
+        const status = (expectedChecksum === actualChecksum);
+        return { addr, cmd, data, status };
+      }
+      return null;
+    }
+
+    function getBaudRate() {
+      const baudRate = document.getElementById("baudRate").value;
+      return parseInt(baudRate, 10);
+    }
+
+    async function connectDevice() {
+      document.getElementById("output").textContent = "Connecting...\n";
+      port = await navigator.serial.requestPort();
+      const baudRate = getBaudRate();
+      await port.open({ baudRate });
+      log("Connected to device at " + baudRate + " bps.");
+      port.baudRate = baudRate;
+      setConnected(true);
+      await getParams();
+    }
+
+    async function disconnectDevice() {
+      if (port && port.readable && port.writable) {
+        await port.close();
+        port = null;
+        setConnected(false);
+        log("Disconnected.");
+      }
+    }
+
+    async function changeBaudRate(newBaudRate) {
+      if (!port || !port.readable) {
+        console.error("Port not open");
+        return;
+      }
+      if (port.baudRate === newBaudRate) {
+        return;
+      }
+      await port.close();
+      await port.open({ baudRate: newBaudRate });
+      port.baudRate = baudRate;
+      log("Baud rate changed to " + newBaudRate + " bps.");
+    }
+
+    async function getParams() {
+      await sendFrame(0x08);
+      const resp = await readResponse();
+      if (!resp || resp.cmd !== (0x08 | 0x80)) {
+        log("Failed to read config.");
+        return;
+      }
+      if (resp.data.length !== 50) {
+        log("Unexpected data length: " + resp.data.length);
+        return;
+      }
+      document.getElementById("baudRate").value = fromBytesBE(resp.data.slice(3, 7)).toString();
+      document.getElementById("workMode").value = `0x${toHex(resp.data[0], 1)}`;
+      document.getElementById("serialMode").value = `0x${toHex(resp.data[1], 1)}`;
+      document.getElementById("devAddr").value = resp.data[2];
+      document.getElementById("usbVid").value = toHex(fromBytesLE(resp.data.slice(11, 13)), 2).toUpperCase();
+      document.getElementById("usbPid").value = toHex(fromBytesLE(resp.data.slice(13, 15)), 2).toUpperCase();
+      log("Config read successfully.");
+    }
+
+    async function setParams() {
+      await sendFrame(0x08);
+      const current = await readResponse();
+
+      if (!current || !current.status || current.cmd !== 0x88 || current.data.length !== 50) {
+        log("Failed to read existing parameters before setting.");
+        return;
+      }
+
+      const data = [...current.data];
+
+      const baud = parseInt(document.getElementById("baudRate").value);
+      const workMode = parseInt(document.getElementById("workMode").value);
+      const serialMode = parseInt(document.getElementById("serialMode").value);
+      const timeoutMs = 3;
+
+      data[0] = workMode;
+      data[1] = serialMode;
+      data[2] = current.data[2]; // keep device address unchanged
+      data.splice(3, 7, ...toBytesBE(baud));
+      data[9] = timeoutMs & 0xFF;
+      data[10] = (timeoutMs >> 8) & 0xFF;
+      data.splice(11, 13, ...toBytesLE(parseInt(document.getElementById("usbVid").value, 16), 2));
+      data.splice(13, 15, ...toBytesLE(parseInt(document.getElementById("usbPid").value, 16), 2));
+
+      await sendFrame(0x09, data);
+      const resp = await readResponse();
+      log("Set Params: " + (resp && resp.data[0] === 0x00 ? "Success" : "Fail"));
+    }
+
+    async function getUSBString() {
+      const type = parseInt(document.getElementById("usbType").value);
+      await sendFrame(0x0A, [type]);
+      const resp = await readResponse();
+      if (!resp || resp.data.length < 2) {
+        log("Failed to read USB string.");
+        return;
+      }
+
+      const len = resp.data[1];
+      const strBytes = resp.data.slice(2, 2 + len);
+      const str = new TextDecoder().decode(new Uint8Array(strBytes));
+      document.getElementById("usbString").value = str;
+      log("USB String read: " + str);
+    }
+
+    async function setUSBString() {
+      const type = parseInt(document.getElementById("usbType").value);
+      const str = document.getElementById("usbString").value;
+      const strBytes = Array.from(new TextEncoder().encode(str));
+      const data = [type, strBytes.length, ...strBytes];
+      await sendFrame(0x0B, data);
+      const resp = await readResponse();
+      log("Set USB String: " + (resp && resp.data[0] === 0x00 ? "Success" : "Fail"));
+    }
+
+    async function setDefaults() {
+      await sendFrame(0x0C);
+      const resp = await readResponse();
+      log("Set Defaults: " + (resp && resp.data[0] === 0x00 ? "Success" : "Fail"));
+      getParams();
+    }
+
+    async function softReset() {
+      await sendFrame(0x0F);
+      const resp = await readResponse();
+      log("Soft Reset: " + (resp && resp.data[0] === 0x00 ? "Success" : "Fail"));
+      const baudRate = getBaudRate();
+      changeBaudRate(baudRate);
+    }
+
+    function log(msg) {
+      document.getElementById("output").textContent += msg + "\n";
+    }
+
+    document.getElementById("connectBtn").addEventListener("click", connectDevice);
+    document.getElementById("disconnectBtn").addEventListener("click", disconnectDevice);
+    document.getElementById("refreshBtn").addEventListener("click", getParams);
+    document.getElementById("setParamsBtn").addEventListener("click", setParams);
+    document.getElementById("getUSBBtn").addEventListener("click", getUSBString);
+    document.getElementById("setUSBBtn").addEventListener("click", setUSBString);
+    document.getElementById("setDefaultsBtn").addEventListener("click", setDefaults);
+    document.getElementById("resetBtn").addEventListener("click", softReset);
+    document.getElementById("usbType").addEventListener("change", getUSBString);
+  </script>
+</body>
+</html>
